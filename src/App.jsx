@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import * as db from "./lib/db";
 
 /* ============================================================================
    PHASE 1 — CAPTURE CORE
@@ -415,18 +416,8 @@ function useSpeech(onFinal, onInterim) {
 }
 
 /* ============================================================================
-   § STORAGE
+   § STORAGE — Supabase. See src/lib/db.js.
    ========================================================================= */
-
-async function loadKey(key, fallback) {
-  try {
-    const r = await window.storage.get(key);
-    return r ? JSON.parse(r.value) : fallback;
-  } catch (e) { return fallback; }
-}
-async function saveKey(key, value) {
-  try { await window.storage.set(key, JSON.stringify(value)); } catch (e) {}
-}
 
 /* ============================================================================
    § STYLES
@@ -567,74 +558,95 @@ export default function App() {
   const [ready, setReady] = useState(false);
   const [flashGroup, setFlashGroup] = useState(null);
   const [editing, setEditing] = useState(null);
+  const [gameId, setGameId] = useState(null);
+  const [dbError, setDbError] = useState(null);
 
   const blip = useBlip();
   const tapeRef = useRef(null);
-  const stateRef = useRef({ dressed, keeper, period });
-  useEffect(() => { stateRef.current = { dressed, keeper, period }; }, [dressed, keeper, period]);
+  const stateRef = useRef({ dressed, keeper, period, gameId });
+  useEffect(() => {
+    stateRef.current = { dressed, keeper, period, gameId };
+  }, [dressed, keeper, period, gameId]);
 
-  // load
+  // load — resumes whatever game is still open, from any device
   useEffect(() => {
     (async () => {
-      setRoster(await loadKey("lax:roster", []));
-      const g = await loadKey("lax:game", null);
-      if (g) {
-        setDressed(g.dressed || []); setKeeper(g.keeper ?? null);
-        setOpponent(g.opponent || ""); setEvents(g.events || []);
-        setPeriod(g.period || 1);
-        if ((g.events || []).length) setScreen("live");
+      try {
+        setRoster(await db.listPlayers());
+        const g = await db.findActiveGame();
+        if (g) {
+          setGameId(g.id);
+          setOpponent(g.opponent || "");
+          setKeeper(g.keeper ?? null);
+          setPeriod(g.period === "OT" ? "OT" : Number(g.period) || 1);
+          setDressed(await db.listGameRoster(g.id));
+          const evs = await db.listEvents(g.id);
+          setEvents(evs);
+          if (evs.length) setScreen("live");
+        }
+      } catch (e) {
+        setDbError(e.message || String(e));
       }
       setReady(true);
     })();
   }, []);
 
-  useEffect(() => { if (ready) saveKey("lax:roster", roster); }, [roster, ready]);
-  useEffect(() => {
-    if (ready) saveKey("lax:game", { dressed, keeper, opponent, events, period });
-  }, [dressed, keeper, opponent, events, period, ready]);
-
   /* --- ingest one utterance --- */
-  const ingest = useCallback((text, asrConf) => {
+  const ingest = useCallback(async (text, asrConf) => {
     if (!text) { setGhost(""); blip("err"); return; }
-    const { dressed: d, keeper: k, period: p } = stateRef.current;
+    const { dressed: d, keeper: k, period: p, gameId: gid } = stateRef.current;
     const res = parseUtterance(text, { dressed: d, keeper: k, asrConf: asrConf ?? 0.9 });
     setGhost("");
 
+    // Write-through: the DB row is the record, local state mirrors it.
+    const persist = async (evs) => {
+      const stamped = evs.map((e) => ({ ...e, period: p }));
+      if (!gid) { setEvents((prev) => [...prev, ...stamped]); return; }
+      try {
+        const saved = await db.insertEvents(gid, stamped);
+        setEvents((prev) => [...prev, ...saved]);
+      } catch (e) {
+        setDbError(e.message || String(e));
+        setEvents((prev) => [...prev, ...stamped]);
+      }
+    };
+
     if (res.type === "command") {
       if (res.command === "undo") {
-        setEvents((prev) => {
-          const live = prev.filter((e) => e.status !== "void");
-          if (!live.length) return prev;
-          const gid = live[live.length - 1].groupId;
-          return prev.map((e) => (e.groupId === gid ? { ...e, status: "void" } : e));
-        });
+        const liveEvs = events.filter((e) => e.status !== "void");
+        if (liveEvs.length) {
+          const g = liveEvs[liveEvs.length - 1].groupId;
+          setEvents((prev) => prev.map((e) => (e.groupId === g ? { ...e, status: "void" } : e)));
+          try { await db.voidEventGroup(g); } catch (e) { setDbError(e.message || String(e)); }
+        }
         blip("warn");
       } else if (res.command === "period") {
-        setPeriod((x) => (x >= 2 ? "OT" : x + 1)); blip("ok");
+        const next = p === "OT" ? "OT" : p >= 2 ? "OT" : p + 1;
+        setPeriod(next); blip("ok");
+        if (gid) { try { await db.updateGameMeta(gid, { period: next }); } catch (e) { setDbError(e.message || String(e)); } }
       } else if (res.command === "keeper" && res.jersey !== null) {
         setKeeper(res.jersey); blip("ok");
+        if (gid) { try { await db.updateGameMeta(gid, { keeper: res.jersey }); } catch (e) { setDbError(e.message || String(e)); } }
       } else if (res.command === "mark") {
-        const ev = mkEvent({ groupId: ulid(), teamSide: "us", jersey: null, statType: "MARK",
-          derived: false, conf: 0.4, transcript: text });
-        setEvents((prev) => [...prev, ev]); blip("warn");
+        await persist([mkEvent({ groupId: ulid(), teamSide: "us", jersey: null, statType: "MARK",
+          derived: false, conf: 0.4, transcript: text })]);
+        blip("warn");
       }
       return;
     }
 
     if (res.type === "unparsed") {
-      const ev = mkEvent({ groupId: ulid(), teamSide: "us", jersey: null, statType: "MARK",
-        derived: false, conf: 0.3, transcript: text, note: res.reason });
-      setEvents((prev) => [...prev, ev]);
+      await persist([mkEvent({ groupId: ulid(), teamSide: "us", jersey: null, statType: "MARK",
+        derived: false, conf: 0.3, transcript: text, note: res.reason })]);
       blip("err");
       return;
     }
 
-    const stamped = res.events.map((e) => ({ ...e, period: p }));
-    setEvents((prev) => [...prev, ...stamped]);
+    await persist(res.events);
     setFlashGroup(res.groupId);
     setTimeout(() => setFlashGroup(null), 550);
     blip(res.confidence >= 0.75 ? "ok" : "warn");
-  }, [blip]);
+  }, [blip, events]);
 
   const onFinal = useCallback((t, c) => ingest(t, c), [ingest]);
   const onInterim = useCallback((t) => setGhost(t), []);
@@ -673,11 +685,48 @@ export default function App() {
       .sort((a, b) => a.jersey - b.jersey);
   }, [live, roster]);
 
-  const setStatus = (id, status) => setEvents((p) => p.map((e) => (e.id === id ? { ...e, status } : e)));
-  const voidGroup = (gid) => setEvents((p) => p.map((e) => (e.groupId === gid ? { ...e, status: "void" } : e)));
-  const setJersey = (gid, j) =>
+  const fail = (e) => setDbError(e.message || String(e));
+
+  const setStatus = async (id, status) => {
+    setEvents((p) => p.map((e) => (e.id === id ? { ...e, status } : e)));
+    try { await db.updateEventStatus(id, status); } catch (e) { fail(e); }
+  };
+  const voidGroup = async (gid) => {
+    setEvents((p) => p.map((e) => (e.groupId === gid ? { ...e, status: "void" } : e)));
+    try { await db.voidEventGroup(gid); } catch (e) { fail(e); }
+  };
+  const setJersey = async (gid, j) => {
     setEvents((p) => p.map((e) => (e.groupId === gid && e.teamSide === "us"
       ? { ...e, jersey: j, status: "committed", parseConfidence: 1 } : e)));
+    try { await db.reassignEventGroupJersey(gid, j); } catch (e) { fail(e); }
+  };
+
+  // Opens a game row (or resumes the open one) and records the dressed list.
+  const startGame = async () => {
+    try {
+      let gid = gameId;
+      if (!gid) {
+        const g = await db.createGame({ opponent });
+        gid = g.id;
+        setGameId(gid);
+      } else {
+        await db.updateGameMeta(gid, { opponent, keeper });
+      }
+      await db.setGameRoster(gid, dressed.map((n) => {
+        const p = roster.find((r) => r.num === n);
+        return { playerId: p.id, jersey: n };
+      }));
+      if (keeper !== null) await db.updateGameMeta(gid, { keeper });
+    } catch (e) { fail(e); }
+    setScreen("live");
+  };
+
+  // Closes the current game so the next one starts clean. The log is kept.
+  const endGame = async () => {
+    if (gameId) { try { await db.finalizeGame(gameId); } catch (e) { fail(e); } }
+    setGameId(null); setEvents([]); setPeriod(1); setKeeper(null); setOpponent("");
+    setScreen("setup");
+  };
 
   const download = (name, text, mime) => {
     const b = new Blob([text], { type: mime });
@@ -698,7 +747,11 @@ export default function App() {
           <h1 className="h1">Pre-game</h1>
           <p className="sub">Tap the players who are dressed. The parser only accepts numbers from this list, which is what makes fourteen-versus-forty survivable.</p>
 
-          <RosterEditor roster={roster} setRoster={setRoster} />
+          {dbError && (
+            <div className="warn"><b>Database error.</b> {dbError}</div>
+          )}
+
+          <RosterEditor roster={roster} setRoster={setRoster} onError={fail} />
 
           <div className="eyebrow" style={{ marginTop: 20 }}>Dressed · {dressed.length}</div>
           <div className="plist">
@@ -743,9 +796,9 @@ export default function App() {
 
           <div style={{ display: "flex", gap: 8, marginTop: 22 }}>
             <button className="btn" style={{ flex: 1 }} disabled={dressed.length === 0}
-              onClick={() => setScreen("live")}>Start game</button>
-            {events.length > 0 && (
-              <button className="btn ghost-b" onClick={() => { setEvents([]); setPeriod(1); }}>Clear log</button>
+              onClick={startGame}>{gameId ? "Back to game" : "Start game"}</button>
+            {gameId && (
+              <button className="btn ghost-b" onClick={endGame}>End game</button>
             )}
           </div>
         </div>
@@ -906,15 +959,22 @@ function fmtTime(iso) {
   return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
 }
 
-function RosterEditor({ roster, setRoster }) {
+function RosterEditor({ roster, setRoster, onError }) {
   const [num, setNum] = useState("");
   const [name, setName] = useState("");
-  const add = () => {
+  const add = async () => {
     const n = parseInt(num, 10);
     if (isNaN(n) || n < 0 || n > 99) return;
     if (roster.some((p) => p.num === n)) return;
-    setRoster([...roster, { num: n, name: name.trim() }]);
     setNum(""); setName("");
+    try {
+      const p = await db.addPlayer(n, name.trim());
+      setRoster((prev) => [...prev, p].sort((a, b) => a.num - b.num));
+    } catch (e) { onError(e); }
+  };
+  const clear = async () => {
+    setRoster([]);
+    try { await db.clearRoster(); } catch (e) { onError(e); }
   };
   return (
     <div>
@@ -930,7 +990,7 @@ function RosterEditor({ roster, setRoster }) {
         <div style={{ marginTop: 8, fontSize: 12, color: "var(--muted)" }}>
           {roster.length} on roster ·{" "}
           <button style={{ textDecoration: "underline", color: "var(--muted)", fontSize: 12 }}
-            onClick={() => setRoster([])}>clear roster</button>
+            onClick={clear}>clear roster</button>
         </div>
       )}
     </div>
