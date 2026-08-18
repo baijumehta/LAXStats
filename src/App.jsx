@@ -22,6 +22,23 @@ const NUM_WORDS = {
   fourty: 40, fifty: 50, sixty: 60, seventy: 70, eighty: 80, ninety: 90,
 };
 
+/* Homophones. "two" and "to" are acoustically identical — the recognizer isn't
+   mishearing, it's picking the token its prose language model finds likelier.
+   These can't be fixed acoustically, only by grammar position (see resolveAmbiguous). */
+const HOMOPHONE_NUM = {
+  to: 2, too: 2, tu: 2, tue: 2, tew: 2,
+  for: 4, fore: 4, faur: 4, ford: 4,
+  won: 1, wan: 1, wun: 1,
+  ate: 8, ait: 8, eit: 8,
+  free: 3, tree: 3, thee: 3, thre: 3,
+  sicks: 6, sics: 6, sex: 6,
+  nein: 9, nyne: 9, nan: 9,
+  tin: 10, tan: 10,
+  owe: 0, ohh: 0,
+  twenny: 20, thirdy: 30, fordy: 40, fourdy: 40, fiddy: 50, fifdy: 50,
+  sixdy: 60, sevendy: 70, aity: 80, ninedy: 90,
+};
+
 // Phrases matched greedily, longest first. [phrase, kind, value]
 const PHRASES = [
   ["free position", "QUAL", "fp"],
@@ -90,17 +107,9 @@ const CONFUSION = {
    § PARSER — pure, portable, no dependencies
    ========================================================================= */
 
-function combineAt(words, i) {
-  const a = NUM_WORDS[words[i]];
-  const b = i + 1 < words.length && words[i + 1] in NUM_WORDS ? NUM_WORDS[words[i + 1]] : null;
-  if (b !== null) {
-    if (a >= 20 && a % 10 === 0 && b > 0 && b < 10) return { val: a + b, consumed: 2 };
-    if (a < 10 && b < 10) return { val: a * 10 + b, consumed: 2 };
-  }
-  return { val: a, consumed: 1 };
-}
-
-export function tokenize(text) {
+/* --- pass 1: atomic tokens. Numbers stay single atoms; homophones are marked
+       AMB rather than committed either way. --- */
+function rawTokens(text) {
   const words = String(text).toLowerCase()
     .replace(/[^a-z0-9\s-]/g, " ").replace(/-/g, " ")
     .split(/\s+/).filter(Boolean);
@@ -116,18 +125,74 @@ export function tokenize(text) {
         break;
       }
     }
-    if (hit) { out.push(hit); i += hit.len; continue; }
+    if (hit) { out.push({ kind: hit.kind, val: hit.val, text: hit.text }); i += hit.len; continue; }
 
     const w = words[i];
-    if (/^\d{1,2}$/.test(w)) { out.push({ kind: "NUM", val: parseInt(w, 10), text: w }); i++; continue; }
+    if (/^\d{1,2}$/.test(w)) {
+      out.push({ kind: "DIG", atom: parseInt(w, 10), literal: true, text: w }); i++; continue;
+    }
     if (w in NUM_WORDS) {
-      const { val, consumed } = combineAt(words, i);
-      out.push({ kind: "NUM", val, text: words.slice(i, i + consumed).join(" ") });
-      i += consumed; continue;
+      const v = NUM_WORDS[w];
+      out.push({ kind: "DIG", atom: v, isTens: v >= 20 && v % 10 === 0, text: w }); i++; continue;
+    }
+    if (w in HOMOPHONE_NUM) {
+      const v = HOMOPHONE_NUM[w];
+      out.push({ kind: "AMB", atom: v, isTens: v >= 20 && v % 10 === 0, text: w }); i++; continue;
     }
     out.push({ kind: "NOISE", text: w }); i++;
   }
   return out;
+}
+
+/* --- pass 2: resolve homophones by grammar position.
+   The trap: "22 goal assist to 14" is natural speech, and a blind to→2 map turns
+   that into jersey #2. So an AMB token counts as filler only in the pattern
+   STAT + AMB + NUMBER. Everywhere else it's a digit, because bare prepositions
+   don't otherwise occur in this grammar. --- */
+function resolveAmbiguous(tokens) {
+  const keep = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (t.kind !== "AMB") { keep.push(t); continue; }
+    const prev = tokens[i - 1];
+    const next = tokens[i + 1];
+    const isFiller = prev && prev.kind === "STAT"
+      && next && (next.kind === "DIG" || next.kind === "AMB");
+    if (isFiller) continue;
+    keep.push({ ...t, kind: "DIG", wasAmbiguous: true });
+  }
+  return keep;
+}
+
+/* --- pass 3: merge adjacent digit atoms.
+   "twenty two"→22 · "two two"→22 · "one four"→14 · "oh three"→3 --- */
+function mergeNumbers(tokens) {
+  const out = [];
+  let i = 0;
+  while (i < tokens.length) {
+    const t = tokens[i];
+    if (t.kind !== "DIG") { out.push(t); i++; continue; }
+    const n = tokens[i + 1];
+    if (n && n.kind === "DIG" && !t.literal && !n.literal) {
+      const a = t.atom, b = n.atom;
+      const amb = t.wasAmbiguous || n.wasAmbiguous;
+      if (t.isTens && b > 0 && b < 10) {
+        out.push({ kind: "NUM", val: a + b, text: `${t.text} ${n.text}`, wasAmbiguous: amb });
+        i += 2; continue;
+      }
+      if (a < 10 && b < 10) {
+        out.push({ kind: "NUM", val: a * 10 + b, text: `${t.text} ${n.text}`, wasAmbiguous: amb });
+        i += 2; continue;
+      }
+    }
+    out.push({ kind: "NUM", val: t.atom, text: t.text, wasAmbiguous: t.wasAmbiguous });
+    i++;
+  }
+  return out;
+}
+
+export function tokenize(text) {
+  return mergeNumbers(resolveAmbiguous(rawTokens(text)));
 }
 
 // Snap a spoken number onto the dressed roster.
@@ -177,22 +242,24 @@ export function parseUtterance(transcript, ctx) {
 
   // --- bind numbers to stats, order-independent ---
   const spoken = [];
-  let pending = null;
+  let pending = null, pendingAmb = false;
   for (let i = 0; i < tokens.length; i++) {
     const t = tokens[i];
-    if (t.kind === "NUM") { pending = t.val; continue; }
+    if (t.kind === "NUM") { pending = t.val; pendingAmb = !!t.wasAmbiguous; continue; }
     if (t.kind !== "STAT") continue;
 
-    let num = pending;
-    if (num !== null) { pending = null; }
+    let num = pending, amb = pendingAmb;
+    if (num !== null) { pending = null; pendingAmb = false; }
     else {
       for (let j = i + 1; j < tokens.length; j++) {
         if (tokens[j].kind === "STAT") break;
-        if (tokens[j].kind === "NUM") { num = tokens[j].val; tokens[j].used = true; break; }
+        if (tokens[j].kind === "NUM") {
+          num = tokens[j].val; amb = !!tokens[j].wasAmbiguous; tokens[j].used = true; break;
+        }
       }
     }
     if (tokens[i].used) continue;
-    spoken.push({ stat: t.val, num });
+    spoken.push({ stat: t.val, num, amb });
   }
 
   if (spoken.length === 0) {
@@ -223,7 +290,10 @@ export function parseUtterance(transcript, ctx) {
     if (s.stat === "SV" && num === null && keeper !== null) num = keeper;
 
     const r = resolveJersey(num, dressed);
-    const conf = Math.min(asrConf, r.conf);
+    // A homophone that landed on a dressed number is probably right, but not as
+    // certain as a word that was unambiguously a number.
+    const ambPenalty = s.amb && r.conf === 1 ? 0.06 : 0;
+    const conf = Math.min(asrConf, r.conf) - ambPenalty;
     worst = Math.min(worst, conf);
 
     const chain = derive(s.stat, fp);
